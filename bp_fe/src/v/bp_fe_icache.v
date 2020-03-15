@@ -135,8 +135,80 @@ module bp_fe_icache
   logic [index_width_lp-1:0]                tag_mem_addr_li;
   logic [lce_assoc_p-1:0][`bp_coh_bits+tag_width_lp-1:0] tag_mem_data_li;
   logic [lce_assoc_p-1:0][`bp_coh_bits+tag_width_lp-1:0] tag_mem_w_mask_li;
+
   logic [lce_assoc_p-1:0][`bp_coh_bits+tag_width_lp-1:0] tag_mem_data_lo;
 
+
+  //tag memory optmization
+
+  //tag_mem optimization logics
+  //some logics are commented out, those are logics no longer used
+  logic [lce_assoc_p-1:0][`bp_coh_bits+tag_width_lp-1:0] tag_mem_data_lo_r;
+  logic [lce_assoc_p-1:0][`bp_coh_bits+tag_width_lp-1:0] tag_mem_data_to_mux_lo;
+  logic [index_width_lp-1:0]                tag_mem_addr_li_r;
+  logic                                     tag_mem_w_li_r;
+  //logic                                     tag_mem_w_li_r_r;
+  logic					    tag_mem_select_v_li;
+  logic					    tag_mem_select_data_li;
+  logic					    tag_mem_diff_addr;
+  //logic					    tag_mem_diff_addr_r;
+  logic                                     tag_mem_v_mux_lo;
+  logic                                     tag_mem_v_mux_lo_r;
+  logic					    tag_mem_no_prev_w;
+
+  enum {eWAIT, eKEEP} 	    tag_mem_state_ps, tag_mem_state_ns, data_mem_states;
+
+  //This FSM is for waiting the valid in when the address stays the same but valid in is low
+  always_comb begin
+    case (tag_mem_state_ps)
+	eWAIT: if (~tag_mem_diff_addr && tag_mem_no_prev_w && tag_mem_v_li)
+		  tag_mem_state_ns = eKEEP;
+		else 
+		  tag_mem_state_ns = eWAIT;
+
+	eKEEP: if (~tag_mem_diff_addr && tag_mem_no_prev_w)
+		  tag_mem_state_ns = eKEEP;
+		else 
+		  tag_mem_state_ns = eWAIT;
+   endcase
+  end
+
+  always_ff @(posedge clk_i) begin
+	if (reset_i) tag_mem_state_ps <= eWAIT;
+	else tag_mem_state_ps <= tag_mem_state_ns;
+  end
+
+  //control logics for tag mem optimization
+  assign tag_mem_diff_addr = (tag_mem_addr_li != tag_mem_addr_li_r);
+  //assign tag_mem_select_data_li = tag_mem_diff_addr_r | tag_mem_w_li_r_r;
+  assign tag_mem_select_v_li = (tag_mem_state_ps == eKEEP);
+
+  assign tag_mem_no_prev_w = (~tag_mem_w_li) & (~tag_mem_w_li_r);
+  //assign tag_mem_select_i = (tag_mem_no_prev_w & (tag_mem_addr_li == tag_mem_addr_li_r));
+  
+  always_comb begin
+    if (~tag_mem_v_mux_lo_r) begin
+	tag_mem_data_lo = tag_mem_data_lo_r;
+    end else begin
+	tag_mem_data_lo = tag_mem_data_to_mux_lo;
+    end 
+  end
+  
+
+
+  always_comb begin
+    if (~tag_mem_no_prev_w || tag_mem_diff_addr) begin
+	tag_mem_v_mux_lo = tag_mem_v_li;
+    end else begin
+	    if (tag_mem_select_v_li) begin
+		tag_mem_v_mux_lo = 0;
+	    end else begin
+		tag_mem_v_mux_lo = tag_mem_v_li;
+	    end 
+    end
+  end
+
+  //instentiate hardened sram module
   bsg_mem_1rw_sync_mask_write_bit #(
     .width_p(lce_assoc_p*(`bp_coh_bits+tag_width_lp))
     ,.els_p(lce_sets_p)
@@ -145,10 +217,10 @@ module bp_fe_icache
     ,.reset_i(reset_i)
     ,.data_i(tag_mem_data_li)
     ,.addr_i(tag_mem_addr_li)
-    ,.v_i(~reset_i & tag_mem_v_li)
-    ,.w_mask_i(tag_mem_w_mask_li)
+    ,.v_i(~reset_i & tag_mem_v_mux_lo)
+    ,.w_mask_i(tag_mem_w_mask_li)	
     ,.w_i(tag_mem_w_li)
-    ,.data_o(tag_mem_data_lo)
+    ,.data_o(tag_mem_data_to_mux_lo)
   );
 
   logic [lce_assoc_p-1:0][`bp_coh_bits-1:0] state_tl;
@@ -158,6 +230,28 @@ module bp_fe_icache
     assign state_tl[i] = tag_mem_data_lo[i][tag_width_lp+:`bp_coh_bits];
     assign tag_tl[i]   = tag_mem_data_lo[i][0+:tag_width_lp];
   end
+  
+  //DFF array for tag mem
+  always_ff @(posedge clk_i) begin
+    if (reset_i) begin
+	tag_mem_data_lo_r <= 0;
+	tag_mem_addr_li_r <= 0;
+	tag_mem_w_li_r <= 1;
+	//tag_mem_w_li_r_r <= 1;
+	//tag_mem_diff_addr_r <= 1;
+	tag_mem_v_mux_lo_r <= 0;
+    end else begin
+	tag_mem_data_lo_r <= tag_mem_data_lo;
+	tag_mem_addr_li_r <= tag_mem_addr_li;
+	tag_mem_w_li_r <= tag_mem_w_li;
+	//tag_mem_w_li_r_r <= tag_mem_w_li_r;
+	//tag_mem_diff_addr_r <= tag_mem_diff_addr;
+	tag_mem_v_mux_lo_r <= tag_mem_v_mux_lo;
+    end
+  end
+
+
+
 
   // data memory
   logic [lce_assoc_p-1:0]                                           data_mem_v_li;
@@ -167,23 +261,111 @@ module bp_fe_icache
   logic [lce_assoc_p-1:0][data_mask_width_lp-1:0]                   data_mem_w_mask_li;
   logic [lce_assoc_p-1:0][dword_width_p-1:0]                        data_mem_data_lo;
 
+
+  //data memory optimization
+  //defining data_mem optimization logics
+  logic [lce_assoc_p-1:0][dword_width_p-1:0] data_mem_data_lo_r;
+  logic [lce_assoc_p-1:0][dword_width_p-1:0] data_mem_data_to_mux_lo;
+
+  logic [lce_assoc_p-1:0][index_width_lp+word_offset_width_lp-1:0]  data_mem_addr_li_r;
+  logic                                     data_mem_w_li_r;
+  logic	[lce_assoc_p-1:0] 		    data_mem_select_v_li;
+  logic	[lce_assoc_p-1:0]		    data_mem_select_data_li;
+  logic	[lce_assoc_p-1:0]		    data_mem_diff_addr;
+  logic [lce_assoc_p-1:0]                   data_mem_v_mux_lo;
+  logic [lce_assoc_p-1:0]                   data_mem_v_mux_lo_r;
+  logic					    data_mem_no_prev_w;
+
+  //typedef enum {eWAIT, eKEEP}		    data_mem_states;
+  //data_mem_states defined with tag_mem_states above
+  //eWIAT 1'b0 eKEEP 1'b1
+  logic [lce_assoc_p-1:0] 		    data_mem_state_ps, data_mem_state_ns;
+  //typedef data_mem_states [lce_assoc_p-1:0] data_mem_state_ns;
+
   // data memory: banks
+  //optimization logics are mostly in generate block since every data_mem needs one set
   for (genvar bank = 0; bank < lce_assoc_p; bank++)
   begin: data_mems
-    bsg_mem_1rw_sync_mask_write_byte #(
-      .data_width_p(dword_width_p)
-      ,.els_p(lce_sets_p*lce_assoc_p) // same number of blocks and ways
-    ) data_mem (
-      .clk_i(clk_i)
-      ,.reset_i(reset_i)
-      ,.data_i(data_mem_data_li[bank])
-      ,.addr_i(data_mem_addr_li[bank])
-      ,.v_i(~reset_i & data_mem_v_li[bank])
-      ,.write_mask_i(data_mem_w_mask_li[bank])
-      ,.w_i(data_mem_w_li)
-      ,.data_o(data_mem_data_lo[bank])
-    );
-  end                                             
+
+	  //similar to the FSM of tag_mem: waiting for valid in signal to be high
+	  always_comb begin
+	    case (data_mem_state_ps[bank])
+		1'b0: if (~data_mem_diff_addr[bank] && data_mem_no_prev_w && data_mem_v_li[bank])
+			  data_mem_state_ns[bank] = 1'b1;
+			else 
+			  data_mem_state_ns[bank] = 1'b0;
+
+		1'b1: if (~data_mem_diff_addr[bank] && tag_mem_no_prev_w)
+			  data_mem_state_ns[bank] = 1'b1;
+			else 
+			  data_mem_state_ns[bank] = 1'b0;
+	   endcase
+	  end
+
+	  always_ff @(posedge clk_i) begin
+		if (reset_i) data_mem_state_ps[bank] <= 1'b0;
+		else data_mem_state_ps[bank] <= data_mem_state_ns[bank];
+	  end
+
+	assign data_mem_diff_addr[bank] = (data_mem_addr_li[bank] != data_mem_addr_li_r[bank]);
+	assign data_mem_select_v_li[bank] = (data_mem_state_ps[bank] == 1'b1);
+	  
+        //choosing signals
+	always_comb begin
+	    if (~data_mem_v_mux_lo_r[bank]) begin
+		data_mem_data_lo[bank] = data_mem_data_lo_r[bank];
+	    end else begin
+		data_mem_data_lo[bank] = data_mem_data_to_mux_lo[bank];
+	    end 
+	end
+	  
+
+
+	  always_comb begin
+	    if (~data_mem_no_prev_w || data_mem_diff_addr[bank]) begin
+		data_mem_v_mux_lo[bank] = data_mem_v_li[bank];
+	    end else begin
+		    if (data_mem_select_v_li[bank]) begin
+			data_mem_v_mux_lo[bank] = 0;
+		    end else begin
+			data_mem_v_mux_lo[bank] = data_mem_v_li[bank];
+		    end 
+	    end
+	  end
+
+
+	    bsg_mem_1rw_sync_mask_write_byte #(
+	      .data_width_p(dword_width_p)
+	      ,.els_p(lce_sets_p*lce_assoc_p) // same number of blocks and ways
+	    ) data_mem (
+	      .clk_i(clk_i)
+	      ,.reset_i(reset_i)
+	      ,.data_i(data_mem_data_li[bank])
+	      ,.addr_i(data_mem_addr_li[bank])
+	      ,.v_i(~reset_i & data_mem_v_mux_lo[bank])
+	      ,.write_mask_i(data_mem_w_mask_li[bank])
+	      ,.w_i(data_mem_w_li)
+	      ,.data_o(data_mem_data_to_mux_lo[bank])
+	    );
+
+  end        
+
+  assign data_mem_no_prev_w = (~data_mem_w_li) & (~data_mem_w_li_r);
+  //DFF array for data_mem
+  always_ff @(posedge clk_i) begin
+    if (reset_i) begin
+	data_mem_data_lo_r <= 0;
+	data_mem_addr_li_r <= 0;
+	data_mem_w_li_r <= 0;
+	data_mem_v_mux_lo_r <= 0;
+    end else begin
+	data_mem_data_lo_r <= data_mem_data_lo;
+	data_mem_addr_li_r <= data_mem_addr_li;
+	data_mem_w_li_r <= data_mem_w_li;
+	data_mem_v_mux_lo_r <= data_mem_v_mux_lo;
+    end
+  end      
+                               
 
   // TV stage
   logic v_tv_r;
